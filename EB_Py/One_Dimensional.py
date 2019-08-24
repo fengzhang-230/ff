@@ -6,10 +6,15 @@ Created on Mon Mar 25 15:48:07 2019
 """
 import pandas as pd
 import numpy as np
-from datetime import datetime
+
 import matplotlib.pyplot as plt
 from matplotlib.dates import DateFormatter, MonthLocator
+from matplotlib.ticker import AutoMinorLocator,FuncFormatter
 from matplotlib.colors import LinearSegmentedColormap
+from sklearn.metrics import mean_squared_error
+import os
+
+
 
 
 
@@ -18,7 +23,7 @@ class Permafrost_one_dimesional(object):
     One-dimensional heat transfer model
     """
 
-    def __init__(self, n_snow_layer, Init_para, simdata):
+    def __init__(self, n_snow_layer, Init_para, simdata,xyn, gradient,node):
         """
         time step is 1 day, error accepted is 0.001, nowlayer is set to 5,        
         and groung surface started from 5 layer.
@@ -30,13 +35,15 @@ class Permafrost_one_dimesional(object):
         self.rtf = 273.15
         self.rhowater = 1000.
         self.ngrnd = int(n_snow_layer)
-
+        self.node=node
+        
         self.Init_para = Init_para
 
         self.load_Init_para()
+        self.hflux =self.hflux*24.*3600
 
         self.simdata = simdata
-        self.years = sorted(list(set(self.simdata["Year"])))
+#        self.years = sorted(list(set(self.simdata["Date"])))
 
         x0 = self.simdata.loc[self.date_onset_sim]
         if x0.empty:
@@ -57,21 +64,26 @@ class Permafrost_one_dimesional(object):
             print('\033[3;30;41m' +
                   "can not find the 'Running ending date'" + '\033[0m')
         else:
-            self.n_final = x2.Date
+            self.n_final = pd.to_datetime(x2.Date)
         
         self.snow = self.simdata[self.date_onset_sim:self.date_final_sim]['Snd']
+        self.snow =self.snow.fillna(0)
         self.airt = self.simdata[self.date_onset_sim:self.date_final_sim]['Ta']
         self.groundt = self.simdata[self.date_onset_sim:self.date_final_sim]['Ts']
         self.sden = self.simdata[self.date_onset_sim:self.date_final_sim]['Sden']
+        
         print("====  Loading initial permafrost temperature profile ...")
-        self.load_ini_tmp()
+        
+        self.load_ini_tmp(xyn,gradient)
+        
         print("====  Loading soil thermal parameters ...")
 
-        f0 = open('geo_par')
+        f0 = open(self.geopar_filename)
         str0 = f0.readline()
         str0 = str0.split(" ")
         self.i_grids = int(str0[0])
         self.n_levels = int(str0[1])
+        
         self.geo_par = np.loadtxt(self.geopar_filename, skiprows=1)
 
         self.theta0 = self.geo_par[:, 0]
@@ -85,20 +97,26 @@ class Permafrost_one_dimesional(object):
         self.uw_d2 = self.geo_par[:, 10]
         self.k_para = self.geo_par[:, 13]
         self.high = self.geo_par[:, 14]
+        
+        self.kcom = np.zeros(self.node)
+        self.cap = np.zeros(self.node)
+        
+        print("====  ")
+        print('\033[3;30;42m' + "====  Initialized"+ '\033[0m')
+        print("====  ")
 
-    def update(self, node):
+    def update(self):
 
         print("====  Running ...")
         print("====  Since " + self.date_onset_sim)
-        self.node = node
-        self.tn = len(self.simdata)
+        self.tn = len(self.airt)
         self.result = np.zeros((self.tn, self.node))
         for ii in np.arange(self.tn):
-            print(f'{float(ii) /self.tn:.3f}')
+#            print(f'{(float(ii) /self.tn):.3f}')
 
             self.mntime = ii
             self.month = self.groundt.index[self.mntime].month
-            self.deltat = 1.0 * self.nstep
+            self.rdeltat = 1.0 * self.nstep
 
             self.snowh = self.snow[self.mntime] + 0.0
 
@@ -109,7 +127,6 @@ class Permafrost_one_dimesional(object):
             self.kcom[0:self.ngrnd] = self.ksnow
             self.cap[0:self.ngrnd] = self.csnow
 
-            self.snowh = round(self.snowh, 2)
             # Following is original diversion in fortran, 5 layers:
 
             if self.snowh <= 0.003:
@@ -128,12 +145,11 @@ class Permafrost_one_dimesional(object):
             for iz in np.arange(self.lmn, self.ngrnd):
                 self.xyn[iz] = -1.0*self.snowh * \
                     (self.ngrnd - iz) / (self.ngrnd - self.lmn)
-                # self.rtt[iz] = self.rairt[self.mntime]
+                self.rtt[iz] =  self.airt[self.mntime]
                 self.dx[iz] = self.snowh/(self.ngrnd - self.lmn)
             if self.lmn == self.ngrnd:
                 self.rtt[self.lmn] = self.groundt[self.mntime]
-            else:
-                self.rtt[self.lmn] = self.airt[self.mntime]
+
             if ii == 0:
 
                 self.snowh == 0.0
@@ -154,28 +170,23 @@ class Permafrost_one_dimesional(object):
                 self.tram()
 
                 if ii != 0:
-                    self.rtt[self.lmn +
-                             1:self.node] = self.dtt[self.lmn+1:self.node]
+                    self.rtt[self.lmn +1:self.node] = self.dtt[self.lmn+1:self.node]
                     break
                 else:
-                    xdf = np.abs(
-                        self.dtt[self.lmn+1:self.node] - self.rtt[self.lmn+1:self.node])
+                    xdf = np.abs(self.dtt[self.lmn+1:self.node] - self.rtt[self.lmn+1:self.node])
                     reee = np.max(xdf)
                     if reee <= self.eet:
 
-                        self.rtt[self.lmn +
-                                 1:self.node] = self.dtt[self.lmn+1:self.node]
+                        self.rtt[self.lmn +1:self.node] = self.dtt[self.lmn+1:self.node]
 
                         break
                     else:
 
-                        self.rtt[self.lmn +
-                                 1:self.node] = self.dtt[self.lmn+1:self.node]
+                        self.rtt[self.lmn +1:self.node] = self.dtt[self.lmn+1:self.node]
 
-                self.result[self.mntime, ] = self.rtt
-
+            self.result[self.mntime, ] = self.rtt
+                
         print('\x1b[6;30;42m' + "====  Finish" + '\x1b[0m')
-
         print("====  ")
 
     def unfrozenwater(self):
@@ -197,11 +208,9 @@ class Permafrost_one_dimesional(object):
 
         # 平衡过程
         # 融化过程
-
         if self.month in [2, 3, 4, 5, 6, 7, 8, 9, 10]:
             for i in np.arange(self.n_levels):
                 if i == 0:
-
                     idx0 = np.where(self.xyn[self.ngrnd:] <= self.high[i])[
                         0] + self.ngrnd
                 else:
@@ -212,15 +221,16 @@ class Permafrost_one_dimesional(object):
                 b[idx0] = self.uw_b2[i]
                 c[idx0] = self.uw_c2[i]
                 d[idx0] = self.uw_d2[i]
+                
                 theta[idx0] = 1.0 - self.theta0[i]
             self.thetau[self.ngrnd:], self.dxthetau[self.ngrnd:] = vfomula_uw(a[self.ngrnd:],
-                                                                              b[self.ngrnd:], c[self.ngrnd:], d[self.ngrnd:], self.rtt[self.ngrnd:])
-            self.thetai[self.ngrnd:] = 1.0 - \
-                theta[self.ngrnd:] - self.thetau[self.ngrnd:]
+                       b[self.ngrnd:], c[self.ngrnd:], d[self.ngrnd:], self.rtt[self.ngrnd:])
+            self.thetai[self.ngrnd:] = 1.0 - theta[self.ngrnd:] - self.thetau[self.ngrnd:]
+#            print(self.thetai)
             self.rll[self.ngrnd:] = self.rhowater * (333.20 + 4.955 * self.rtt[self.ngrnd:]
-                                                     + 0.02987 * self.rtt[self.ngrnd:]**2.) / 1000.
+                                + 0.02987 * self.rtt[self.ngrnd:]**2.) / 1000.
             idx2 = np.where(self.thetai[self.ngrnd:] < 0.)[0] + self.ngrnd
-            self.thetai[idx2] = 0
+            self.thetai[idx2] = 0.
             self.rkk = np.array([0.25, 0.25, 0.35, 0.1, 1.1, 1.1, 1.1, 2.])
 
         else:
@@ -243,26 +253,16 @@ class Permafrost_one_dimesional(object):
                 a[self.ngrnd:], b[self.ngrnd:], c[self.ngrnd:], d[self.ngrnd:], self.rtt[self.ngrnd:])
             self.thetai[self.ngrnd:] = 1.0 - \
                 theta[self.ngrnd:] - self.thetau[self.ngrnd:]
-            self.rll[self.ngrnd:] = self.rhowater * \
-                (333.20 + 4.955 * self.rtt[self.ngrnd:] +
-                 0.02987 * self.rtt[self.ngrnd:]**2.) / 1000.
+            self.rll[self.ngrnd:] = self.rhowater * (333.20 + 4.955 * self.rtt[self.ngrnd:] +
+                                0.02987 * self.rtt[self.ngrnd:]**2.) / 1000.
             idx2 = np.where(self.thetai[self.ngrnd:] < 0.)[0] + self.ngrnd
-            self.thetai[idx2] = 0
+            self.thetai[idx2] = 0.
             self.rkk = np.array([0.25, 0.25, 0.35, 0.1, 1.1, 1.1, 1.1, 2.])
-
-    def cal_rmse(self, x, y):
-
-        x = np.reshape(x, np.size(x))
-        y = np.reshape(y, np.size(y))
-
-        idx_nan = np.where(~np.isnan(x-y))
-        return np.sqrt(((x[idx_nan] - y[idx_nan]) ** 2).mean())
 
     def heat_conduc(self):
         kice = np.zeros(self.node)
         kwater = np.zeros(self.node)
-        ksoil = np.zeros(self.node)
-        self.kcom = np.zeros(self.node)
+        ksoil = np.zeros(self.node)        
 
         for i in np.arange(self.n_levels):
             if i == 0:
@@ -272,13 +272,11 @@ class Permafrost_one_dimesional(object):
                 idx0 = np.where((self.xyn[self.ngrnd:] <= self.high[i]) & (
                     self.xyn[self.ngrnd:] > self.high[i-1]))[0] + self.ngrnd
 
-            ksoil[idx0] = self.k_para[i]
+            ksoil[idx0] = self.rkk[i]
 
-        kice[self.ngrnd:] = 0.4685 + 488.19 / \
-            (self.rtf + self.rtt[self.ngrnd:])
+        kice[self.ngrnd:] = 0.4685 + 488.19 /(self.rtf + self.rtt[self.ngrnd:])
 
-        kwater[self.ngrnd:] = 0.11455 + 1.6318E-3 * \
-            (self.rtf + self.rtt[self.ngrnd:])
+        kwater[self.ngrnd:] = 0.11455 + 1.6318E-3 * (self.rtf + self.rtt[self.ngrnd:])
 
         self.kcom[self.ngrnd:] = kice[self.ngrnd:] ** self.thetai[self.ngrnd:] *\
             ksoil[self.ngrnd:]**(1.0-self.thetau[self.ngrnd:]-self.thetai[self.ngrnd:]) *\
@@ -290,7 +288,7 @@ class Permafrost_one_dimesional(object):
         capice = np.zeros(self.node)
         capwater = np.zeros(self.node)
         cap_v = np.zeros(self.node)
-        self.cap = np.zeros(self.node)
+        capsoil=np.zeros(self.node)
         csoil = self.geo_par[:, 1]
         # 青藏高原不同半径热融湖下融区发展差异的非线性分析    令锋、吴青柏
         for i in np.arange(self.n_levels):
@@ -300,7 +298,7 @@ class Permafrost_one_dimesional(object):
             else:
                 idx0 = np.where((self.xyn[self.ngrnd:] <= self.high[i]) & (
                     self.xyn[self.ngrnd:] > self.high[i-1]))[0] + self.ngrnd
-            csoil[idx0] = csoil[i]
+            capsoil[idx0] = csoil[i]
         capice[self.ngrnd:] = 1.94 + 7.14E-3 * self.rtt[self.ngrnd:]
         capwater[self.ngrnd:] = 4.20843 + 1.11362E-1 * self.rtt[self.ngrnd:] + \
             5.12142E-3 * self.rtt[self.ngrnd:]**2 + \
@@ -308,9 +306,9 @@ class Permafrost_one_dimesional(object):
         cap_v[self.ngrnd:] = self.thetau[self.ngrnd:] * capwater[self.ngrnd:] + \
             self.thetai[self.ngrnd:] * capice[self.ngrnd:] + \
             (1.0 - self.thetau[self.ngrnd:] -
-             self.thetai[self.ngrnd:]) * csoil[self.ngrnd:]
+             self.thetai[self.ngrnd:]) * capsoil[self.ngrnd:]
         self.cap[self.ngrnd:] = (cap_v[self.ngrnd:] +
-                                 self.rll[self.ngrnd:]*self.dxthetau[self.ngrnd:]) * 1.0E6
+                    self.rll[self.ngrnd:]*self.dxthetau[self.ngrnd:]) * 1.0E6
 
     def snow_k_c(self):
         self.ksnow = self.snowden ** 2 * 2.9E-6
@@ -401,48 +399,52 @@ class Permafrost_one_dimesional(object):
         self.apzero = np.zeros(self.node)
 
         self.rkw[self.lmn+1:self.ngrnd+1] = self.kcom[self.lmn:self.ngrnd]
-        self.rkw[self.ngrnd + 1:(self.node - 1)] = 2.0 * self.kcom[self.ngrnd:(self.node - 2)] * \
-            self.kcom[(self.ngrnd+1):(self.node-1)] / (self.kcom[self.ngrnd:(self.node-2)] +
-                                                       self.kcom[(self.ngrnd+1):(self.node-1)])
+        self.rkw[self.ngrnd + 1:(self.node - 1)] = 2.0 * \
+            self.kcom[self.ngrnd:(self.node - 2)] * self.kcom[(self.ngrnd+1):
+                (self.node-1)] / (self.kcom[self.ngrnd:(self.node-2)] +
+                self.kcom[(self.ngrnd+1):(self.node-1)])
 
         self.rke[self.lmn+1:self.ngrnd] = self.kcom[self.lmn+1:self.ngrnd]
-        self.rke[self.ngrnd:(self.node - 1)] = 2.0 * self.kcom[self.ngrnd:(self.node - 1)] *
-        self.kcom[(self.ngrnd+1):(self.node)] / (self.kcom[self.ngrnd:(self.node-1)] +
-                                                 self.kcom[(self.ngrnd+1):(self.node)])
+        self.rke[self.ngrnd:(self.node - 1)] = 2.0 * self.kcom[self.ngrnd:(self.node - 1)] *\
+            self.kcom[(self.ngrnd+1):(self.node)] / (self.kcom[self.ngrnd:(self.node-1)] +
+            self.kcom[(self.ngrnd+1):(self.node)])
 
-        self.A[self.lmn+1:self.node-1] = self.rkw[self.lmn +
-                                                  1:self.node-1] / self.dx[self.lmn:self.node-2]
-        self.C[self.lmn+1:self.node-1] = self.rke[self.lmn +
-                                                  1:self.node-1] / self.dx[self.lmn+1:self.node-1]
+        self.A[self.lmn+1:self.node-1] = self.rkw[self.lmn +1:self.node-1] / \
+            self.dx[self.lmn:self.node-2]
+        self.C[self.lmn+1:self.node-1] = self.rke[self.lmn +1:self.node-1] / \
+            self.dx[self.lmn+1:self.node-1]
 
-        self.rcw[self.lmn+1:self.node-1] = self.rccc[self.lmn:self.node -
-                                                     2] * self.dx[self.lmn:self.node-2]
-        self.rce[self.lmn+1:self.node-1] = self.rccc[self.lmn +
-                                                     2:self.node] * self.dx[self.lmn+1:self.node-1]
+        self.rcw[self.lmn+1:self.node-1] = self.cap[self.lmn:self.node -2] * \
+            self.dx[self.lmn:self.node-2]
+        self.rce[self.lmn+1:self.node-1] = self.cap[self.lmn +2:self.node] * \
+            self.dx[self.lmn+1:self.node-1]
 
         self.rcccp[self.lmn + 1:self.node - 1] = (self.rcw[self.lmn + 1:self.node - 1] +
-                                                  self.rce[self.lmn+1:self.node-1]) / (self.dx[self.lmn+1:self.node-1] +
-                                                                                       self.dx[self.lmn:self.node-2])
+              self.rce[self.lmn+1:self.node-1]) / (self.dx[self.lmn+1:self.node-1] +
+              self.dx[self.lmn:self.node-2])
 
         self.rdx[self.lmn + 1:self.node - 1] = (self.dx[self.lmn + 1:self.node - 1] +
-                                                self.dx[self.lmn:self.node-2])/2.0
+            self.dx[self.lmn:self.node-2])/2.0
 
         self.apzero[self.lmn + 1:self.node - 1] = self.rcccp[self.lmn + 1:self.node - 1] * \
             self.rdx[self.lmn+1:self.node-1] / self.rdeltat
 
         self.B[self.lmn+1:self.node-1] = -1.0*(self.A[self.lmn+1:self.node-1] +
-                                               self.C[self.lmn+1:self.node-1] + self.apzero[self.lmn+1:self.node-1])
+              self.C[self.lmn+1:self.node-1] + self.apzero[self.lmn+1:self.node-1])
 
-        self.D[self.lmn+1] = -1.0*self.apzero[self.lmn+1] * \
-            self.rtt[self.lmn+1] - self.A[self.lmn+1] * self.rtt[self.lmn]
-        self.D[self.lmn+2:self.node-1] = -1.0*self.apzero[self.lmn +
-                                                          2:self.node-1] * self.rtt[self.lmn+2:self.node-1]
+        self.D[self.lmn+1] = -1.0*self.apzero[self.lmn+1] * self.rtt[self.lmn+1] - \
+            self.A[self.lmn+1] * self.rtt[self.lmn]
+        self.D[self.lmn+2:self.node-1] = -1.0*self.apzero[self.lmn +2:self.node-1] * \
+            self.rtt[self.lmn+2:self.node-1]
 
         self.A[self.node-1] = self.kcom[self.node-2]/self.dx[self.node-2]
         self.C[self.node-1] = 0.0
         self.B[self.node-1] = -1.0*self.A[self.node-1]
-        self.D[self.node-1] = -1.0*self.qq
+        self.D[self.node-1] = -1.0*self.hflux
 
+#        if self.mntime==2:
+#            print('===============Wrangh===================================='*5)
+#            os.system("pause")
     def tram(self):
 
         rp = np.zeros(self.node)
@@ -456,7 +458,7 @@ class Permafrost_one_dimesional(object):
             rp[i] = -1.0*self.C[i]/pp
             rqq = self.D[i] - self.A[i] * rq[i-1]
             rq[i] = rqq/pp
-
+        
         self.dtt = np.zeros(self.node)
         self.dtt[self.node-1] = rq[self.node-1]
         for i in np.arange(self.node-2, self.lmn+0, -1):
@@ -470,25 +472,28 @@ class Permafrost_one_dimesional(object):
 
         self.xyn[self.ngrnd:] = xyn
 
-        self.dx[self.ngrnd:self.node - 1] = self.xyn[(self.ngrnd + 1):self.node] \
-            - self.xyn[self.ngrnd:self.node-1]
+        self.dx[self.ngrnd:self.node - 1] = self.xyn[(self.ngrnd + 1):self.node]\
+                                            - self.xyn[self.ngrnd:self.node-1]
         self.rtt[self.ngrnd:self.node] = gradient
 
     def finalize(self):
-        print "====  Reorgnizing model results ..."
+        print("====  Reorgnizing model results ...")
         # Extract soil temperatures:
-        self.model_date = self.simdata[self.n_start:self.n_final+1]['Date']
+        self.model_date = self.simdata[self.n_start:self.n_final+pd.to_timedelta(1)]['Date']
         self.model_depth = self.xyn[self.ngrnd:]
 
-        self.model_input_air = self.rairt[self.n_start:self.n_final+1]
-        self.model_input_gsf = self.rmt[self.n_start:self.n_final+1]
-        self.model_input_snd = self.rsnow[self.n_start:self.n_final+1]
+        self.model_input_air = self.airt[self.n_start:(self.n_final+pd.to_timedelta(1))]
+        self.model_input_gsf = self.groundt[self.n_start:(self.n_final+pd.to_timedelta(1))]
+        self.model_input_snd = self.snow[self.n_start:(self.n_final+pd.to_timedelta(1))]
 
-        self.model_t_soil = self.result[self.n_start:self.n_final+1,self.ngrnd:]
+        idx0 = np.where(self.model_date.index==self.date_onset_sim)[0][0]
+        idx1 = np.where(self.model_date.index==self.date_final_running)[0][0]
+        self.model_t_soil = self.result[idx0:idx1+1,self.ngrnd:]
         self.model_date_matrix = self.datevec(self.model_date)
-
+        
         print("====  ")
         print('\x1b[5;30;42m' + "====  The end ..." + '\x1b[0m')
+        np.savetxt(r'E:\Model\python\Ebo\model_t_soil.csv',self.result,delimiter =',')
         return self.model_date, self.model_t_soil, self.model_depth
     def datevec(self, date_ordinal):
 
@@ -499,9 +504,9 @@ class Permafrost_one_dimesional(object):
         for xx in date_ordinal:
             cont = cont + 1
             x = pd.to_datetime(xx)
-            date_0[cont, 0] = x.year
-            date_0[cont, 1] = x.month
-            date_0[cont, 2] = x.day
+            date[cont, 0] = x.year
+            date[cont, 1] = x.month
+            date[cont, 2] = x.day
         return date
 
 class Combine_obs_sim(object):
@@ -511,75 +516,67 @@ class Combine_obs_sim(object):
 
     def __init__(self, obs_soilt):
 
-        self.obs_soilt = obs_soilt #  observed soil temperatures at depths
+        self.obs_soilt = obs_soilt  #  observed soil temperatures at depths
 
-    def combine_obsim(self, calib_period_onset, calib_period_end, calib_depth):
+    def combine_obsim(self, calib_depth,calib_depths,model_date,model_t_soil, 
+                      model_depth,calib_period_onset, calib_period_end):
 
-        one_d = Permafrost_one_dimesional()
-        self.model_date, self.model_t_soil, self.model_depth = one_d.finalize()
-        calib_depths = one_d.load_Init_para()
-        x0 = self.model_date.loc[calib_period_onset]
+        self.model_date= model_date
+        self.model_t_soil= model_t_soil
+        self.model_depth=model_depth
 
-        if x0.empty:
-            print('\x1b[6;30;42m' + \
-                "can not find the 'Calibration start date' in Simulated results" + '\x1b[0m')
-        else:
-            print('OK')
-            x0 = x0
-            
-        x1 = self.model_date.loc[calib_period_end]
-        if x1.empty:
-            print('\x1b[6;30;42m' +
-                "can not find the 'Calibration rnd date' in Simulated results" + '\x1b[0m') 
-        else:
-            x1=x1
-    
-        self.obs_date = self.obs_soilt.index[0]
-        y0 = self.obs_date.loc[calib_period_onset]
+        x0 = self.model_date[calib_period_onset]            
+        x1 = self.model_date[calib_period_end]
+
+        y0 = self.obs_soilt.loc[calib_period_onset]
         if y0.empty:
             print("can not find the 'Calibration start date' in obs Soil Temp")
         else:
             y0 = y0.Date
-        y1 = self.obs_date.loc[calib_period_end]
+        y1 = self.obs_soilt.loc[calib_period_end]
         if y1.empty:
             print("can not find the 'Calibration end date' in obs Soil Temp")
         else:
             y1 = y1.Date
         idx1 = np.where(abs(calib_depths - calib_depth) <= 0.0001)[0] + 1
-        self.col = self.obs_soilt.columns[idx]
-        obs = self.obs_soilt[y0:y1][col]
+        self.col = self.obs_soilt.columns[idx1]
+        obs = self.obs_soilt[y0:y1][self.col]
 
         self.model_t_soil = pd.DataFrame(self.model_t_soil)
-        self.model_t_soil.index = pd.to_datetime(x0, x1)
+        self.model_t_soil.index = pd.date_range(x0, x1)
         
         self.idx0 = np.where(abs(self.model_depth - calib_depth) <= 0.0001)[0]
         
-        sim = self.model_t_soil[x0:x1][idx0]
+        sim = self.model_t_soil[x0:x1][self.idx0]
         
-        comp_data = pd.concat((obs1, sim), axis=1)
-
+        comp_data = pd.concat((obs, sim), axis=1)
+        self.model_t_soil.to_csv(r'E:\Model\python\Ebo\model_t.csv')
         return comp_data
+        
+    def plot_obs_sim_data(self, ax,comp_data,calib_depth, ylim):
 
-    def plot_obs_sim_data(self, ax,calib_period_onset, calib_period_end, calib_depth, ylim):
-
-        calib_depth = float(calib_depth)
-        comp_data = self.combine_obsim(calib_period_onset, calib_period_end, calib_depth)
-        calib_depth = float(calib_depth)
-        comp_data = self.confrontations_obs_sim_data(
-            calib_period_onset, calib_period_end, calib_depth)
-
-        fig, ax = plt.subplots(figsize=(6, 4))
+#        fig, ax = plt.subplots(figsize=(6, 4))
 
         obs = comp_data[self.col]
         sim = comp_data[self.idx0]
-
-        plt.plot(obs, 'r.', lw=0.8,label='Obs')
+        
+        plt.plot(obs, 'r.', lw=0.4,label='Obs')
         plt.plot(sim, 'k-', lw=1,label='Sim')
-        ax.legend(loc=0, shadow=True)
+#        ax.legend(loc=0, shadow=True)
         print(f'{calib_depth:.2f}' + ' cm')
         plt.ylim(ylim)
+        
+        ax.xaxis.set_minor_locator(AutoMinorLocator(5))
+        ax.yaxis.set_minor_locator(AutoMinorLocator(5))
+        plt.title(f'{calib_depth:.2f}' + ' cm')
+        comp_data1 = comp_data.dropna()        
+        obs1 = comp_data1[self.col].values
+        sim1 = comp_data1[self.idx0].values
 
-    def plot_temperature_field(self, onset, ending, depth_bot, colors):
+        self.rmse = np.sqrt(mean_squared_error(obs1,sim1))
+        self.nash = 1-(np.sum(((obs1-sim1)**2))/np.sum((obs1-obs1.mean())**2))
+
+    def plot_temperature_field(self,colors, onset, ending, depth_bot):
 
         year0 = onset[-4:]
         year1 = ending[-4:]
@@ -588,18 +585,16 @@ class Combine_obs_sim(object):
             date_label = year0+'-'+year1
         else:
             date_label = year0
-
-
-        idx0 = np.where(self.model_date == date0)[0][0]
-        idx1 = np.where(self.model_date == date1)[0][0]
-
+            
+#        model_t.index = pd.to_date_range(onset,periods=len(model_t))
         date_selected = self.model_date[onset:ending]
 
         depth_index = np.where(self.model_depth <= depth_bot)[0]
 
-        depth_selected = self.model_depth.iloc[depth_index]
-
+        depth_selected = self.model_depth[depth_index]
+        
         t_soil_selected = self.model_t_soil[onset:ending].iloc[:, depth_index]
+        
 
         t_max = np.nanmax(t_soil_selected)
         t_min = np.nanmin(t_soil_selected)
@@ -611,12 +606,10 @@ class Combine_obs_sim(object):
 
         colorm = LinearSegmentedColormap.from_list('NCL_Default', colors)
 
-        fig2, ax2 = plt.subplots(figsize=(6, 3))
-#        levels = [-15, -10, -5, -2.5, -2.0, -1.5, -1.0, -0.5, 0, 0.5, 1, 1.5, 2.0, 2.5, 5, 10, 15]
+        fig, ax = plt.subplots(figsize=(6, 3))
         cs3 = plt.contourf(date_selected, depth_selected,
                            np.transpose(t_soil_selected),
-                           levels,
-                           extend='both', cmap=self.cm)
+                           levels,extend='both', cmap=colorm)
         cs0 = plt.contour(date_selected, depth_selected,
                           np.transpose(t_soil_selected), [-1, 0, 1], colors='k')
 
@@ -624,28 +617,25 @@ class Combine_obs_sim(object):
 
         months = MonthLocator(range(1, 13), bymonthday=1, interval=10)
         monthsFmt = DateFormatter("%Y-%m")
-        ax2.xaxis.set_major_locator(months)
-        ax2.xaxis.set_major_formatter(monthsFmt)
-        for ticketlabel in ax2.xaxis.get_ticklabels():
+        ax.xaxis.set_major_locator(months)
+        ax.xaxis.set_major_formatter(monthsFmt)
+        for ticketlabel in ax.xaxis.get_ticklabels():
             ticketlabel.set_rotation(30)
-        ax2.autoscale_view()
-        ax2.minorticks_on()
-#        plt.xlabel('date',fontsize=16)
-#        plt.xlabel(date_label,fontsize=11)
+        ax.autoscale_view()
+        ax.minorticks_on()
 
         plt.ylabel('Depth (m)', fontsize=11)
         plt.grid(axis='both')
         plt.xticks(fontsize=9)
         plt.yticks(fontsize=9)
-        fig2.gca().invert_yaxis()
+        fig.gca().invert_yaxis()
         font = {'family': 'serif',
                 'color': 'black',
                 'weight': 'normal',
                 'size': 11,
                 }
 
-        cbar = plt.colorbar(
-            cs3, label='Soil Temperature ($^\circ$C)', ticks=levels)
+        cbar = plt.colorbar(cs3, label='Soil Temperature ($^\circ$C)', ticks=levels)
         cbar.set_label('Soil Temperature ($^\circ$C)', fontdict=font)
 
     def get_temp_profile(self, onset, ending):
@@ -663,9 +653,9 @@ class Combine_obs_sim(object):
 
     def get_obstemp_profile(self, calib_depths, onset, ending):
 
-        profile_data = self.obs_soilt[onset, ending].iloc[:,1:]
+        profile_data = self.obs_soilt[onset:ending].iloc[:,1:]
         profile_data = np.transpose(profile_data)
-        profile      = np.zeros((np.size(profile_data, axis=0), 7))
+        profile      = np.zeros((np.size(calib_depths, axis=0), 7))
         profile[:, 0] = calib_depths
         profile[:,1] = np.nanmin(profile_data, axis = 1)
         profile[:,2] = np.nanmean(profile_data, axis = 1)
@@ -678,10 +668,10 @@ class Combine_obs_sim(object):
         profile = self.get_temp_profile(onset, ending)
 
         bore = pd.DataFrame()
-        bore['min'] = np.nanmin(bore_t, axis=1)
-        bore['mean'] = np.nanmean(bore_t, axis=1)
-        bore['max'] = np.nanmax(bore_t, axis=1)
-        bore['dep'] = dep
+        bore['min'] = np.nanmin(bore_tem, axis=1)
+        bore['mean'] = np.nanmean(bore_tem, axis=1)
+        bore['max'] = np.nanmax(bore_tem, axis=1)
+        bore['dep'] = bore_dep
 
         title = onset[-4:]+'-'+ending[-4:]
 
@@ -696,7 +686,7 @@ class Combine_obs_sim(object):
         plt.plot(bore['min'], bore['dep'],  'b--', label='Min_obs')
         plt.plot(bore['mean'], bore['dep'], 'k--', label='Avg_obs')
         plt.plot(bore['max'], bore['dep'], 'r--', label='Max_obs')
-        plt.plot([0, 0], [0, np.max(model_depth)], 'k-')
+        plt.plot([0, 0], [0, np.max(self.model_depth)], 'k-')
 
         plt.ylim(0, 16)
         plt.legend(shadow=False, loc=3, bbox_to_anchor=(
@@ -712,6 +702,7 @@ class Combine_obs_sim(object):
         plt.gca().invert_yaxis()
 
     def plot_obstemp_profile(self, ax, calib_depths, onset, ending, ylim):
+        
         profile0 = self.get_temp_profile(onset, ending)
         profile1 = self.get_obstemp_profile(calib_depths, onset, ending)
 
@@ -725,6 +716,7 @@ class Combine_obs_sim(object):
         plt.plot(profile1[:,3], profile1[:,0], 'r--',label='Max_obs')
         plt.plot([0,0], [0,np.max(self.model_depth)],'k-')               
         
+        title = onset[-4:]+'-'+ending[-4:]
         plt.ylim(ylim)
         plt.xlabel('Soil Temperature ($^\circ$C)',fontsize=11)
         plt.xlim(-14,14)
@@ -735,11 +727,5 @@ class Combine_obs_sim(object):
         plt.gca().invert_yaxis()      
         
     
-
-
-
-
-
-sim_result = pd.read_csv(r'E:\Model\EB\self.model_t_soil.csv',header=None)
         
         
